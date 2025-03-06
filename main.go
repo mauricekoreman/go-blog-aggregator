@@ -38,8 +38,10 @@ func main() {
 	commands.register("reset", handleResetAllUsers)
 	commands.register("users", handleGetAllUsers)
 	commands.register("agg", handleAgg)
-	commands.register("addfeed", handleAddFeed)
+	commands.register("addfeed", middlewareLoggedIn(handleAddFeed))
 	commands.register("feeds", handleGetAllFeeds)
+	commands.register("follow", middlewareLoggedIn(handleFollowFeed))
+	commands.register("following", middlewareLoggedIn(handleGetFeedFollowsForUser))
 
 	argsWithoutProg := os.Args[1:]
 
