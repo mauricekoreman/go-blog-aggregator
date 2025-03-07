@@ -2,10 +2,17 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"encoding/xml"
 	"fmt"
+	"html"
+	"io"
+	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 	"github.com/mauricekoreman/blog-aggregator/internal/database"
 )
 
@@ -118,18 +125,20 @@ func handleGetAllUsers(s *state, cmd command) error {
 
 func handleAgg(s *state, cmd command) error {
 	if len(cmd.args) < 1 {
-		return fmt.Errorf("a feed URL is required")
+		return fmt.Errorf("a time_between_req is required")
 	}
 
-	feedURL := cmd.args[0]
-	feed, err := fetchFeed(context.Background(), feedURL)
+	timeBetweenRequests, err := time.ParseDuration(cmd.args[0])
 	if err != nil {
-		return fmt.Errorf("error fetching feed: %w", err)
+		return fmt.Errorf("error parsing duration: %w", err)
 	}
 
-	fmt.Printf("Feed fetched successfully! Feed details: %v", feed)
+	fmt.Printf("Collection feeds every %v", timeBetweenRequests)
+	ticker := time.NewTicker(timeBetweenRequests)
 
-	return nil
+	for ; ; <-ticker.C {
+		scrapeFeeds(s)
+	}
 }
 
 func handleAddFeed(s *state, cmd command, user database.User) error {
@@ -224,6 +233,32 @@ func handleFeedUnfollow(s *state, cmd command, user database.User) error {
 	return nil
 }
 
+func handleBrowse(s *state, cmd command, user database.User) error {
+	limit := 2
+	if len(cmd.args) > 0 {
+		newLimit, err := strconv.Atoi(cmd.args[0])
+		if err != nil {
+			return fmt.Errorf("not a valid limit")
+		}
+
+		limit = newLimit
+	}
+
+	posts, err := s.db.GetPostsForUser(context.Background(), database.GetPostsForUserParams{
+		ID:    user.ID,
+		Limit: int32(limit),
+	})
+	if err != nil {
+		return fmt.Errorf("error getting posts for user: %w", err)
+	}
+
+	for _, post := range posts {
+		fmt.Printf("\n* %s (%s)", post.Title, post.Url)
+	}
+
+	return nil
+}
+
 // utils
 func followFeed(s *state, userId uuid.UUID, feedId uuid.UUID) (database.CreateFeedFollowRow, error) {
 	feedFollowDetails, err := s.db.CreateFeedFollow(context.Background(), database.CreateFeedFollowParams{
@@ -238,4 +273,105 @@ func followFeed(s *state, userId uuid.UUID, feedId uuid.UUID) (database.CreateFe
 	}
 
 	return feedFollowDetails, nil
+}
+
+func scrapeFeeds(s *state) error {
+	nextFeed, err := s.db.GetNextFeedToFetch(context.Background())
+	if err != nil {
+		return fmt.Errorf("failed to get the next feed to fetch: %w", err)
+	}
+
+	err = s.db.MarkFeedFetched(context.Background(), database.MarkFeedFetchedParams{
+		ID: nextFeed.ID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to mark the next feed as fetched: %w", err)
+	}
+
+	feed, err := fetchFeed(context.Background(), nextFeed.Url)
+	if err != nil {
+		return fmt.Errorf("error fetching feed: %w", err)
+	}
+
+	for _, item := range feed.Channel.Item {
+		var parsedTime time.Time
+		parsedTime, _ = time.Parse(item.PubDate, "2025-03-06 17:51:17.095801")
+
+		err = s.db.CreatePost(context.Background(), database.CreatePostParams{
+			ID:          uuid.New(),
+			CreatedAt:   time.Now(),
+			UpdatedAt:   time.Now(),
+			Title:       item.Title,
+			Description: sql.NullString{String: item.Description, Valid: item.Description != ""},
+			Url:         item.Link,
+			PublishedAt: sql.NullTime{Time: parsedTime, Valid: parsedTime != time.Time{}},
+			FeedID:      nextFeed.ID,
+		})
+
+		if pqErr, ok := err.(*pq.Error); ok {
+			if pqErr.Code == "23505" {
+				continue
+			} else {
+				fmt.Println("Postgres error code: " + pqErr.Code)
+			}
+		} else {
+			fmt.Println("erorr occurred creating post: " + err.Error())
+		}
+	}
+
+	return nil
+}
+
+type RSSFeed struct {
+	Channel struct {
+		Title       string    `xml:"title"`
+		Link        string    `xml:"link"`
+		Description string    `xml:"description"`
+		Item        []RSSItem `xml:"item"`
+	} `xml:"channel"`
+}
+
+type RSSItem struct {
+	Title       string `xml:"title"`
+	Link        string `xml:"link"`
+	Description string `xml:"description"`
+	PubDate     string `xml:"pubDate"`
+}
+
+func fetchFeed(ctx context.Context, feedURL string) (*RSSFeed, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", feedURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	req.Header.Set("User-Agent", "gator")
+
+	client := http.Client{}
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("error sending request: %w", err)
+	}
+
+	defer res.Body.Close()
+
+	data, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, fmt.Errorf("error reading response: %w", err)
+	}
+
+	feed := RSSFeed{}
+	xml.Unmarshal(data, &feed)
+
+	feed.Channel.Description = html.UnescapeString(feed.Channel.Description)
+	feed.Channel.Link = html.UnescapeString(feed.Channel.Link)
+	feed.Channel.Title = html.UnescapeString(feed.Channel.Title)
+
+	for i := range feed.Channel.Item {
+		feed.Channel.Item[i].Description = html.UnescapeString(feed.Channel.Item[i].Description)
+		feed.Channel.Item[i].Link = html.UnescapeString(feed.Channel.Item[i].Link)
+		feed.Channel.Item[i].PubDate = html.UnescapeString(feed.Channel.Item[i].PubDate)
+		feed.Channel.Item[i].Title = html.UnescapeString(feed.Channel.Item[i].Title)
+	}
+
+	return &feed, nil
 }
