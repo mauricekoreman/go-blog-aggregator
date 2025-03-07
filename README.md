@@ -1,4 +1,4 @@
-This was a project on Boot.dev, making a blog aggregator
+This was a project on Boot.dev
 
 Make sure you have the following installed:
 - Golang
